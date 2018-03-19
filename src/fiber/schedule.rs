@@ -223,7 +223,7 @@ impl Scheduler {
     }
     fn next_runnable(&mut self) -> Option<fiber::FiberId> {
         while let Some(fiber_id) = self.run_queue.pop_front() {
-            self.metrics.exited_fibers.increment();
+            self.metrics.dequeued_fibers.increment();
             if let Some(fiber) = self.fibers.get_mut(&fiber_id) {
                 fiber.in_run_queue = false;
                 return Some(fiber_id);
