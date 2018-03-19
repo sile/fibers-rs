@@ -10,12 +10,13 @@ keywords = ["async", "thread", "fiber", "futures"]
 license = "MIT"
 
 [dependencies]
-mio = "0.6"
 futures = "0.1"
-splay_tree = "0.2"
-num_cpus = "1"
 handy_async = "0.2"
+mio = "0.6"
+num_cpus = "1"
 nbchan = "0.1"
+prometrics = "0.1"
+splay_tree = "0.2"
 
 [dev-dependencies]
 clap = "2"

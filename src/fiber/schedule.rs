@@ -5,6 +5,7 @@ use std::sync::atomic;
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc as std_mpsc;
 use std::cell::RefCell;
+use prometrics::metrics::{Counter, MetricBuilder};
 use futures::{Async, Future, Poll};
 
 use fiber::{self, Task};
@@ -24,6 +25,33 @@ type RequestReceiver = std_mpsc::Receiver<Request>;
 
 /// The identifier of a scheduler.
 pub type SchedulerId = usize;
+
+#[derive(Debug)]
+struct SchedulerMetrics {
+    spawned_fibers: Counter,
+    exited_fibers: Counter,
+    enqueued_fibers: Counter,
+    dequeued_fibers: Counter,
+    fiber_runs: Counter,
+    idles: Counter,
+}
+impl SchedulerMetrics {
+    fn new(id: SchedulerId) -> Self {
+        let mut builder = MetricBuilder::new();
+        builder
+            .namespace("fibers")
+            .subsystem("scheduler")
+            .label("scheduler_id", &id.to_string());
+        SchedulerMetrics {
+            spawned_fibers: builder.counter("spawned_fibers_total").finish().unwrap(),
+            exited_fibers: builder.counter("exited_fibers_total").finish().unwrap(),
+            enqueued_fibers: builder.counter("enqueued_fibers_total").finish().unwrap(),
+            dequeued_fibers: builder.counter("dequeued_fibers_total").finish().unwrap(),
+            fiber_runs: builder.counter("fiber_runs_total").finish().unwrap(),
+            idles: builder.counter("idles_total").finish().unwrap(),
+        }
+    }
+}
 
 /// Scheduler of spawned fibers.
 ///
@@ -45,19 +73,22 @@ pub struct Scheduler {
     request_tx: RequestSender,
     request_rx: RequestReceiver,
     poller: poll::PollerHandle,
+    metrics: SchedulerMetrics,
 }
 impl Scheduler {
     /// Creates a new scheduler instance.
     pub fn new(poller: poll::PollerHandle) -> Self {
         let (request_tx, request_rx) = std_mpsc::channel();
+        let scheduler_id = unsafe { NEXT_SCHEDULER_ID.fetch_add(1, atomic::Ordering::SeqCst) };
         Scheduler {
-            scheduler_id: unsafe { NEXT_SCHEDULER_ID.fetch_add(1, atomic::Ordering::SeqCst) },
+            scheduler_id,
             next_fiber_id: 0,
             fibers: HashMap::new(),
             run_queue: VecDeque::new(),
             request_tx: request_tx,
             request_rx: request_rx,
             poller: poller,
+            metrics: SchedulerMetrics::new(scheduler_id),
         }
     }
 
@@ -100,13 +131,18 @@ impl Scheduler {
             // Task
             if let Some(fiber_id) = self.next_runnable() {
                 did_something = true;
+                self.metrics.fiber_runs.increment();
                 self.run_fiber(fiber_id);
             }
 
             if !block_if_idle || did_something {
+                if !did_something {
+                    self.metrics.idles.increment();
+                }
                 break;
             }
 
+            self.metrics.idles.increment();
             let request = self.request_rx.recv().expect("must succeed");
             did_something = true;
             self.handle_request(request);
@@ -127,6 +163,7 @@ impl Scheduler {
         let fiber_id = self.next_fiber_id();
         self.fibers
             .insert(fiber_id, fiber::FiberState::new(fiber_id, task));
+        self.metrics.spawned_fibers.increment();
         self.schedule(fiber_id);
     }
     fn run_fiber(&mut self, fiber_id: fiber::FiberId) {
@@ -162,6 +199,7 @@ impl Scheduler {
         };
         if finished {
             self.fibers.remove(&fiber_id);
+            self.metrics.exited_fibers.increment();
         } else if is_runnable {
             self.schedule(fiber_id);
         }
@@ -178,12 +216,14 @@ impl Scheduler {
     fn schedule(&mut self, fiber_id: fiber::FiberId) {
         let fiber = assert_some!(self.fibers.get_mut(&fiber_id));
         if !fiber.in_run_queue {
+            self.metrics.enqueued_fibers.increment();
             self.run_queue.push_back(fiber_id);
             fiber.in_run_queue = true;
         }
     }
     fn next_runnable(&mut self) -> Option<fiber::FiberId> {
         while let Some(fiber_id) = self.run_queue.pop_front() {
+            self.metrics.exited_fibers.increment();
             if let Some(fiber) = self.fibers.get_mut(&fiber_id) {
                 fiber.in_run_queue = false;
                 return Some(fiber_id);
@@ -239,6 +279,10 @@ impl<'a> Context<'a> {
     /// Returns the identifier of the current exeuction context.
     pub fn context_id(&self) -> super::ContextId {
         (self.scheduler.id, self.fiber.fiber_id)
+    }
+
+    pub fn scheduler_id(&self) -> SchedulerId {
+        self.scheduler.id
     }
 
     /// Parks the current fiber.

@@ -190,6 +190,7 @@ extern crate handy_async;
 extern crate mio;
 extern crate nbchan;
 extern crate num_cpus;
+extern crate prometrics;
 extern crate splay_tree;
 
 macro_rules! assert_some {
