@@ -4,6 +4,7 @@
 use std::sync::atomic;
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc as std_mpsc;
+use std::time;
 use std::cell::RefCell;
 use prometrics::metrics::{Counter, MetricBuilder};
 use futures::{Async, Future, Poll};
@@ -33,7 +34,9 @@ struct SchedulerMetrics {
     enqueued_fibers: Counter,
     dequeued_fibers: Counter,
     fiber_runs: Counter,
+    polls: Counter,
     idles: Counter,
+    idle_seconds: Counter,
 }
 impl SchedulerMetrics {
     fn new(id: SchedulerId) -> Self {
@@ -48,7 +51,9 @@ impl SchedulerMetrics {
             enqueued_fibers: builder.counter("enqueued_fibers_total").finish().unwrap(),
             dequeued_fibers: builder.counter("dequeued_fibers_total").finish().unwrap(),
             fiber_runs: builder.counter("fiber_runs_total").finish().unwrap(),
+            polls: builder.counter("polls_total").finish().unwrap(),
             idles: builder.counter("idles_total").finish().unwrap(),
+            idle_seconds: builder.counter("idle_seconds_total").finish().unwrap(),
         }
     }
 }
@@ -116,6 +121,8 @@ impl Scheduler {
 
     /// Runs one unit of works.
     pub fn run_once(&mut self, block_if_idle: bool) {
+        self.metrics.polls.increment();
+
         let mut did_something = false;
         loop {
             // Request
@@ -143,7 +150,13 @@ impl Scheduler {
             }
 
             self.metrics.idles.increment();
+            let start_time = time::Instant::now();
             let request = self.request_rx.recv().expect("must succeed");
+            let elapsed = start_time.elapsed();
+            let elapsed_seconds =
+                elapsed.as_secs() as f64 + (elapsed.subsec_nanos() as f64 / 1_000_000_000.0);
+            let _ = self.metrics.idle_seconds.add(elapsed_seconds);
+
             did_something = true;
             self.handle_request(request);
         }

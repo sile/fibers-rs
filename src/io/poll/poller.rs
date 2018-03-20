@@ -9,6 +9,7 @@ use std::sync::mpsc::{RecvError, TryRecvError};
 use std::sync::Arc;
 use std::sync::atomic::{self, AtomicUsize};
 use futures::{self, Future};
+use prometrics::metrics::{Counter, MetricBuilder};
 use mio;
 use nbchan::mpsc as nb_mpsc;
 
@@ -58,6 +59,84 @@ impl Registrant {
     }
 }
 
+static POLLER_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::ATOMIC_USIZE_INIT;
+
+#[derive(Debug)]
+struct PollerMetrics {
+    enqueued_timers: Counter,
+    dequeued_timers: Counter,
+    cancelled_timers: Counter,
+    register_requests: Counter,
+    deregister_requests: Counter,
+    monitor_requests: Counter,
+    set_timeout_requests: Counter,
+    cancel_timeout_requests: Counter,
+    polls: Counter,
+    readable_events: Counter,
+    writable_events: Counter,
+    wait_seconds: Counter,
+}
+impl PollerMetrics {
+    fn new() -> Self {
+        let id = POLLER_ID.fetch_add(1, ::std::sync::atomic::Ordering::SeqCst);
+        let mut builder = MetricBuilder::new();
+        builder
+            .namespace("fibers")
+            .subsystem("poller")
+            .label("poller_id", &id.to_string());
+        PollerMetrics {
+            polls: builder.counter("polls_total").finish().unwrap(),
+            enqueued_timers: builder.counter("enqueued_timers_total").finish().unwrap(),
+            dequeued_timers: builder
+                .counter("dequeued_timers_total")
+                .label("type", "expired")
+                .finish()
+                .unwrap(),
+            cancelled_timers: builder
+                .counter("dequeued_timers_total")
+                .label("type", "cancelled")
+                .finish()
+                .unwrap(),
+            register_requests: builder
+                .counter("requests_total")
+                .label("type", "register")
+                .finish()
+                .unwrap(),
+            deregister_requests: builder
+                .counter("requests_total")
+                .label("type", "deregister")
+                .finish()
+                .unwrap(),
+            monitor_requests: builder
+                .counter("requests_total")
+                .label("type", "monitor")
+                .finish()
+                .unwrap(),
+            set_timeout_requests: builder
+                .counter("requests_total")
+                .label("type", "set_timeout")
+                .finish()
+                .unwrap(),
+            cancel_timeout_requests: builder
+                .counter("requests_total")
+                .label("type", "cancel_timeout")
+                .finish()
+                .unwrap(),
+            readable_events: builder
+                .counter("io_events_total")
+                .label("type", "readable")
+                .finish()
+                .unwrap(),
+            writable_events: builder
+                .counter("io_events_total")
+                .label("type", "writable")
+                .finish()
+                .unwrap(),
+            wait_seconds: builder.counter("wait_seconds_total").finish().unwrap(),
+        }
+    }
+}
+
 /// I/O events poller.
 #[derive(Debug)]
 pub struct Poller {
@@ -69,6 +148,7 @@ pub struct Poller {
     next_timeout_id: Arc<AtomicUsize>,
     registrants: HashMap<mio::Token, Registrant>,
     timeout_queue: HeapMap<(time::Instant, usize), oneshot::Sender<()>>,
+    metrics: PollerMetrics,
 }
 impl Poller {
     /// Creates a new poller.
@@ -95,6 +175,7 @@ impl Poller {
             next_timeout_id: Arc::new(AtomicUsize::new(0)),
             registrants: HashMap::new(),
             timeout_queue: HeapMap::new(),
+            metrics: PollerMetrics::new(),
         })
     }
 
@@ -110,6 +191,8 @@ impl Poller {
     ///
     /// On the former case, the poller notifies the fibers waiting on those events.
     pub fn poll(&mut self, timeout: Option<time::Duration>) -> io::Result<()> {
+        self.metrics.polls.increment();
+
         let mut did_something = false;
 
         // Request
@@ -125,6 +208,7 @@ impl Poller {
         // Timeout
         let now = time::Instant::now();
         while let Some((_, notifier)) = self.timeout_queue.pop_if(|k, _| k.0 <= now) {
+            self.metrics.dequeued_timers.increment();
             let _ = notifier.send(());
         }
 
@@ -142,13 +226,22 @@ impl Poller {
         } else {
             timeout
         };
+
+        let start_time = time::Instant::now();
         let _ = self.poll.poll(&mut self.events.0, timeout)?;
+        let elapsed = start_time.elapsed();
+        let elapsed_seconds =
+            elapsed.as_secs() as f64 + (elapsed.subsec_nanos() as f64 / 1_000_000_000.0);
+        let _ = self.metrics.wait_seconds.add(elapsed_seconds);
+
         for e in self.events.0.iter() {
             let r = assert_some!(self.registrants.get_mut(&e.token()));
             if e.readiness().is_readable() {
+                self.metrics.readable_events.increment();
                 for _ in r.read_waitings.drain(..).map(|tx| tx.exit(Ok(()))) {}
             }
             if e.readiness().is_writable() {
+                self.metrics.writable_events.increment();
                 for _ in r.write_waitings.drain(..).map(|tx| tx.exit(Ok(()))) {}
             }
             Self::mio_register(&self.poll, e.token(), r)?;
@@ -169,17 +262,20 @@ impl Poller {
     fn handle_request(&mut self, request: Request) -> io::Result<()> {
         match request {
             Request::Register(evented, mut reply) => {
+                self.metrics.register_requests.increment();
                 let token = self.next_token();
                 self.registrants.insert(token, Registrant::new(evented));
                 (reply.0)(token);
             }
             Request::Deregister(token) => {
+                self.metrics.deregister_requests.increment();
                 let r = assert_some!(self.registrants.remove(&token));
                 if !r.is_first {
                     self.poll.deregister(&*r.evented.0)?;
                 }
             }
             Request::Monitor(token, interest, notifier) => {
+                self.metrics.monitor_requests.increment();
                 let r = assert_some!(self.registrants.get_mut(&token));
                 match interest {
                     Interest::Read => r.read_waitings.push(notifier),
@@ -190,13 +286,17 @@ impl Poller {
                 }
             }
             Request::SetTimeout(timeout_id, expiry_time, reply) => {
+                self.metrics.set_timeout_requests.increment();
                 assert!(
                     self.timeout_queue
                         .push_if_absent((expiry_time, timeout_id), reply,)
                 );
+                self.metrics.enqueued_timers.increment();
             }
             Request::CancelTimeout(timeout_id, expiry_time) => {
+                self.metrics.cancel_timeout_requests.increment();
                 self.timeout_queue.remove(&(expiry_time, timeout_id));
+                self.metrics.cancelled_timers.increment();
             }
         }
         Ok(())
