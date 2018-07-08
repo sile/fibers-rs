@@ -52,7 +52,7 @@ pub mod timer {
     /// a timer only consumpts constant memory region.
     #[derive(Debug)]
     pub struct Timeout {
-        start: time::Instant,
+        start: time::SystemTime,
         duration: time::Duration,
         inner: Option<poll::poller::Timeout>,
     }
@@ -60,7 +60,7 @@ pub mod timer {
     /// Makes a future which will expire after `delay_from_now`.
     pub fn timeout(delay_from_now: time::Duration) -> Timeout {
         Timeout {
-            start: time::Instant::now(),
+            start: time::SystemTime::now(),
             duration: delay_from_now,
             inner: None,
         }
@@ -73,7 +73,7 @@ pub mod timer {
                 inner.poll()
             } else {
                 let duration = self.duration;
-                let elapsed = self.start.elapsed();
+                let elapsed = self.start.elapsed().unwrap_or_default();
                 if elapsed >= duration {
                     return Ok(Async::Ready(()));
                 }

@@ -7,9 +7,9 @@ use nbchan::mpsc as nb_mpsc;
 use std::collections::HashMap;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::{self, AtomicUsize};
 use std::sync::mpsc::{RecvError, TryRecvError};
+use std::sync::Arc;
 use std::time;
 
 use super::{EventedLock, Interest, SharableEvented};
@@ -68,7 +68,7 @@ pub struct Poller {
     next_token: usize,
     next_timeout_id: Arc<AtomicUsize>,
     registrants: HashMap<mio::Token, Registrant>,
-    timeout_queue: HeapMap<(time::Instant, usize), oneshot::Sender<()>>,
+    timeout_queue: HeapMap<(time::SystemTime, usize), oneshot::Sender<()>>,
 }
 impl Poller {
     /// Creates a new poller.
@@ -123,7 +123,7 @@ impl Poller {
         }
 
         // Timeout
-        let now = time::Instant::now();
+        let now = time::SystemTime::now();
         while let Some((_, notifier)) = self.timeout_queue.pop_if(|k, _| k.0 <= now) {
             let _ = notifier.send(());
         }
@@ -132,7 +132,7 @@ impl Poller {
         let timeout = if did_something {
             Some(time::Duration::from_millis(0))
         } else if let Some((k, _)) = self.timeout_queue.peek() {
-            let duration_until_next_expiry_time = k.0 - now;
+            let duration_until_next_expiry_time = k.0.duration_since(now).unwrap_or_default();
             if let Some(timeout) = timeout {
                 use std::cmp;
                 Some(cmp::min(timeout, duration_until_next_expiry_time))
@@ -267,7 +267,7 @@ impl PollerHandle {
 
     fn set_timeout(&self, delay_from_now: time::Duration) -> Timeout {
         let (tx, rx) = oneshot::channel();
-        let expiry_time = time::Instant::now() + delay_from_now;
+        let expiry_time = time::SystemTime::now() + delay_from_now;
         let timeout_id = self.next_timeout_id.fetch_add(1, atomic::Ordering::SeqCst);
         let request = Request::SetTimeout(timeout_id, expiry_time, tx);
         let _ = self.request_tx.send(request);
@@ -289,7 +289,7 @@ pub fn set_timeout(poller: &PollerHandle, delay_from_now: time::Duration) -> Tim
 #[derive(Debug)]
 struct CancelTimeout {
     timeout_id: usize,
-    expiry_time: time::Instant,
+    expiry_time: time::SystemTime,
     request_tx: RequestSender,
 }
 impl CancelTimeout {
@@ -413,6 +413,6 @@ enum Request {
     Register(BoxEvented, RegisterReplyFn),
     Deregister(mio::Token),
     Monitor(mio::Token, Interest, oneshot::Monitored<(), io::Error>),
-    SetTimeout(usize, time::Instant, oneshot::Sender<()>),
-    CancelTimeout(usize, time::Instant),
+    SetTimeout(usize, time::SystemTime, oneshot::Sender<()>),
+    CancelTimeout(usize, time::SystemTime),
 }
